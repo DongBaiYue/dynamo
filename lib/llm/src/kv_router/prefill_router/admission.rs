@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tracing::Instrument;
 
 use dynamo_kv_router::selector::WorkerSelector;
@@ -24,6 +24,18 @@ use crate::{
     },
 };
 
+/// The prompt-side routed-experts blob a prefill worker reports, if any.
+fn prompt_routed_experts(output: &Annotated<LLMEngineOutput>) -> Option<String> {
+    output
+        .data
+        .as_ref()?
+        .engine_data
+        .as_ref()?
+        .get("routed_experts")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 impl<Sel> PrefillRouter<Sel>
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
@@ -32,6 +44,7 @@ where
         mut prefill_response: ManyOut<Annotated<LLMEngineOutput>>,
         tracker: Option<Arc<RequestTracker>>,
         task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
+        prompt_shard_tx: Option<oneshot::Sender<Option<String>>>,
     ) -> Result<PrefillCompletion, PrefillError> {
         let Some(first_output) = prefill_response.next().await else {
             return Err(PrefillError::PrefillError(
@@ -69,11 +82,17 @@ where
                     && obj.contains_key("bootstrap_room")
             });
 
+        // The prompt shard rides a later chunk, so only the drain below sees it.
+        let mut prompt_shard = prompt_routed_experts(&first_output);
+
         if !is_bootstrap {
             while let Some(next) = prefill_response.next().await {
                 if let Some(error) = next.err() {
                     let detail = format!("Prefill router returned error in output stream: {error}");
                     return Err(PrefillError::PrefillError(detail, Some(Box::new(error))));
+                }
+                if let Some(found) = prompt_routed_experts(&next) {
+                    prompt_shard = Some(found);
                 }
                 if let Some(output) = next.data.as_ref()
                     && prompt_tokens_details.is_none()
@@ -84,10 +103,20 @@ where
                         .and_then(|usage| usage.prompt_tokens_details.clone());
                 }
             }
+            if let Some(tx) = prompt_shard_tx {
+                let _ = tx.send(prompt_shard);
+            }
         } else {
             tokio::spawn(async move {
                 let _task_guard = task_guard;
-                while prefill_response.next().await.is_some() {}
+                while let Some(next) = prefill_response.next().await {
+                    if let Some(found) = prompt_routed_experts(&next) {
+                        prompt_shard = Some(found);
+                    }
+                }
+                if let Some(tx) = prompt_shard_tx {
+                    let _ = tx.send(prompt_shard);
+                }
             });
         }
 
@@ -152,13 +181,21 @@ where
         prefill_stream: ManyOut<Annotated<LLMEngineOutput>>,
         tracker: Option<Arc<RequestTracker>>,
         phase_transition_permit: OwnedSemaphorePermit,
+        prompt_shard_tx: Option<oneshot::Sender<Option<String>>>,
     ) {
         let span = tracing::Span::current();
         let task_guard = self.task_guard.clone();
         tokio::spawn(
             async move {
                 drop(phase_transition_permit);
-                match Self::consume_prefill_stream(prefill_stream, tracker, task_guard).await {
+                match Self::consume_prefill_stream(
+                    prefill_stream,
+                    tracker,
+                    task_guard,
+                    prompt_shard_tx,
+                )
+                .await
+                {
                     Ok(_) => tracing::debug!("Prefill background task completed"),
                     Err(error) => tracing::warn!("Prefill background task error: {error:?}"),
                 }
@@ -220,6 +257,7 @@ mod tests {
             response,
             None,
             Some(task_guard),
+            None,
         )
         .await
         .unwrap();
@@ -242,6 +280,7 @@ mod tests {
             prefill_stream(vec![Annotated::from_error("prefill failed")]),
             Some(tracker.clone()),
             None,
+            None,
         )
         .await;
 
@@ -262,6 +301,7 @@ mod tests {
                 Annotated::from_error("prefill stream failed"),
             ]),
             Some(tracker.clone()),
+            None,
             None,
         )
         .await;
@@ -291,6 +331,7 @@ mod tests {
                 prefill_stream(vec![Annotated::from_data(output)]),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -317,6 +358,7 @@ mod tests {
             prefill_stream(vec![Annotated::from_data(output)]),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -336,6 +378,7 @@ mod tests {
         };
         let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
             prefill_stream(vec![Annotated::from_data(output)]),
+            None,
             None,
             None,
         )
@@ -361,6 +404,7 @@ mod tests {
             };
             let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
                 prefill_stream(vec![Annotated::from_data(output)]),
+                None,
                 None,
                 None,
             )

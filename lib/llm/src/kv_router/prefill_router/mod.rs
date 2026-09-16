@@ -6,8 +6,10 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use serde_json::Value;
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -28,6 +30,7 @@ use dynamo_runtime::{
     protocols::{EndpointId, annotated::Annotated},
 };
 use futures::stream::{self, StreamExt};
+use futures::{FutureExt, TryFutureExt};
 
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
@@ -466,6 +469,9 @@ where
 
         let router = &binding.router;
         let endpoint_id = &binding.endpoint_id;
+        // The prefill drain is detached, so its routing shard needs a way back here.
+        let (prompt_shard_tx, prompt_shard_rx) = oneshot::channel();
+        let mut prompt_shard_tx = Some(prompt_shard_tx);
         let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
             let (prepared, prefill_stream) = router
                 .select_and_dispatch_prefill(prefill_context, |request, target| {
@@ -474,16 +480,25 @@ where
                 .await?;
             let topology_constraints = prepared.topology_constraints;
             let outcome = if let Some(bootstrap_info) = prepared.bootstrap_info {
-                self.spawn_prefill_task(prefill_stream, tracker, prefill_phase_barrier);
+                self.spawn_prefill_task(
+                    prefill_stream,
+                    tracker,
+                    prefill_phase_barrier,
+                    prompt_shard_tx.take(),
+                );
                 PrefillOutcome::Bootstrap {
                     bootstrap_info,
                     worker_id: prepared.worker_id,
                 }
             } else {
                 drop(prefill_phase_barrier);
-                let completion =
-                    Self::consume_prefill_stream(prefill_stream, tracker, self.task_guard.clone())
-                        .await?;
+                let completion = Self::consume_prefill_stream(
+                    prefill_stream,
+                    tracker,
+                    self.task_guard.clone(),
+                    prompt_shard_tx.take(),
+                )
+                .await?;
 
                 match completion {
                     PrefillCompletion::Handoff {
@@ -584,8 +599,54 @@ where
             self.conditional_disagg_policy.is_enabled(),
         ));
 
-        next.generate(context.map(|_| decode_req)).await
+        let decode_stream = next.generate(context.map(|_| decode_req)).await?;
+        Ok(splice_prompt_routed_experts(decode_stream, prompt_shard_rx))
     }
+}
+
+/// Replace decode's prompt prefix, which its routers never produced, with prefill's shard.
+fn splice_prompt_routed_experts(
+    decode_stream: ManyOut<Annotated<LLMEngineOutput>>,
+    prompt_shard: oneshot::Receiver<Option<String>>,
+) -> ManyOut<Annotated<LLMEngineOutput>> {
+    let context = decode_stream.context();
+    // Shared: every chunk carrying the blob is fixed up, and the drain resolves once.
+    let prompt_shard = prompt_shard.unwrap_or_else(|_| None).shared();
+    let spliced = decode_stream.then(move |mut item| {
+        let prompt_shard = prompt_shard.clone();
+        async move {
+            let decode_shard = item
+                .data
+                .as_ref()
+                .and_then(|data| data.engine_data.as_ref())
+                .and_then(|engine_data| engine_data.get("routed_experts"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            // Absent unless routing was requested, so other chunks never wait on prefill.
+            let Some(decode_shard) = decode_shard else {
+                return item;
+            };
+            let Some(prefix) = prompt_shard.await else {
+                return item;
+            };
+            if let Some(merged) = splice_base64_rows(&prefix, &decode_shard)
+                && let Some(engine_data) =
+                    item.data.as_mut().and_then(|data| data.engine_data.as_mut())
+            {
+                engine_data["routed_experts"] = Value::String(merged);
+            }
+            item
+        }
+    });
+    ResponseStream::new(Box::pin(spliced), context)
+}
+
+/// ``prefix`` then the bytes of ``decode`` past it; None leaves the blob untouched.
+fn splice_base64_rows(prefix: &str, decode: &str) -> Option<String> {
+    let mut merged = BASE64_STANDARD.decode(prefix).ok()?;
+    let decode_bytes = BASE64_STANDARD.decode(decode).ok()?;
+    merged.extend_from_slice(decode_bytes.get(merged.len()..)?);
+    Some(BASE64_STANDARD.encode(merged))
 }
 
 impl<Sel> PrefillRouter<Sel>
@@ -1172,5 +1233,19 @@ mod tests {
             "bootstrap_room": 1,
         });
         assert!(extract_bootstrap_info(&params).is_none());
+    }
+
+    #[test]
+    fn splice_base64_rows_prefix_overrides_decode() {
+        let pre = BASE64_STANDARD.encode(b"AA");
+        let dec = BASE64_STANDARD.encode(b"AABB");
+        assert_eq!(
+            splice_base64_rows(&pre, &dec),
+            Some(BASE64_STANDARD.encode(b"AABB"))
+        );
+        // Prefix longer than decode → cannot splice.
+        assert_eq!(splice_base64_rows(&dec, &pre), None);
+        // Invalid base64 → None.
+        assert_eq!(splice_base64_rows("!!!", &dec), None);
     }
 }

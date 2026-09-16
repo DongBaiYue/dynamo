@@ -21,7 +21,10 @@ from dynamo.sglang.engine_generate import (
 )
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
-from dynamo.sglang.request_handlers.llm.decode_handler import _sampling_option_params
+from dynamo.sglang.request_handlers.llm.decode_handler import (
+    DecodeWorkerHandler,
+    _sampling_option_params,
+)
 from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
     build_disagg_mm_kwargs,
     raise_if_unextracted_multimodal,
@@ -57,6 +60,12 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         self.bootstrap_host, self.bootstrap_port = self._get_bootstrap_info(self.engine)
         super().__init__(engine, config, publisher, generate_endpoint, shutdown_event)
         self._consume_tasks: set[asyncio.Task[Any]] = set()
+        # Prompt rows are captured here only: decode gets the KV, never runs the routers.
+        self._routed_experts_kwargs: Dict[
+            str, Any
+        ] = DecodeWorkerHandler._resolve_routed_experts_kwargs(
+            self.engine, self.config.server_args
+        )
         logging.info(
             f"Prefill worker handler initialized - bootstrap host: {self.bootstrap_host}, bootstrap port: {self.bootstrap_port}"
         )
@@ -201,6 +210,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 rid=trace_id,
                 data_parallel_rank=dp_rank,
                 lora_path=lora_path,
+                **self._routed_experts_kwargs,
                 **priority_kwargs,
                 **agent_session_kwargs(self.engine, inner_request),
             )
@@ -224,29 +234,47 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         self._consume_tasks.add(task)
         task.add_done_callback(self._consume_tasks.discard)
 
-        await task
+        routed_experts = await task
+        if routed_experts is not None:
+            # Not the first chunk: consume_prefill_stream reads bootstrap from that one.
+            yield {
+                "token_ids": [],
+                "text": None,
+                "finish_reason": None,
+                "engine_data": {"routed_experts": routed_experts},
+            }
 
     async def _consume_results(
         self, results: AsyncIterator[Any], context: Context
-    ) -> None:
-        """Consume async generator results without processing.
+    ) -> Optional[str]:
+        """Consume async generator results, returning the captured prompt routing.
 
         Args:
             results: Async generator from engine.async_generate.
             context: Context object for cancellation handling.
+
+        Returns:
+            The base64 routed-experts blob, or None when nothing was captured.
         """
+        routed_experts: Optional[str] = None
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
         async with self._cancellation_monitor(request_id_future, context):
             async for res in results:
+                meta_info = res.get("meta_info", {})
                 # Extract SGLang request ID from the first response and set the future
                 if not request_id_future.done():
-                    meta_info = res.get("meta_info", {})
                     sglang_request_id = meta_info.get("id")
                     if sglang_request_id:
                         request_id_future.set_result(sglang_request_id)
                         logging.debug(f"New Prefill Request ID: {sglang_request_id}")
 
+                # Last non-None wins: the blob grows with the captured rows.
+                captured = meta_info.get("routed_experts")
+                if captured is not None:
+                    routed_experts = captured
+
                 # Note: No explicit cancellation checks needed here.
                 # When abort_request is called by the cancellation monitor,
                 # SGLang will terminate this async generator automatically.
+        return routed_experts
